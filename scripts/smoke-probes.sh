@@ -10,7 +10,7 @@
 #       提醒 cron，等提醒信投进主人的 Wonton 私聊。
 # 数据：data_write/data_check 用应用自己的 REST API（api_key 认证，key 从 profile 页取）。
 
-wallos_origin() { # 入口可能带路径（/wonton-login.php），拼 API 前取 origin
+wallos_origin() { # 契约里 SMOKE_WEB_URL 可能带路径（kit 冒烟）也可能是裸 origin（e2e），统一剥成 origin
   local u="${SMOKE_WEB_URL%%\?*}" rest="${SMOKE_WEB_URL#*://}"
   printf '%s://%s' "${u%%://*}" "${rest%%/*}"
 }
@@ -19,20 +19,25 @@ wallos_origin() { # 入口可能带路径（/wonton-login.php），拼 API 前�
 # 入口 wonton-login.php → 核心授权（带核心会话一路 302）→ 应用回调建会话。
 # 不用 dweb --sso：套件的表单识别会把 Wallos 页面里的 POST 表单（如加订阅）当成 SSO 表单去提交。
 wallos_session() {
+  local entry
   [[ -n "${SMOKE_JAR:-}" && -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
     { echo "缺冒烟变量：需要 SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
   curl -sS --noproxy '*' -o /dev/null -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
     --data-urlencode "token=$SMOKE_TOKEN" "$SMOKE_BASE/_wonton/login" ||
     { echo "主人令牌登不进核心" >&2; return 1; }
+  entry="$(wallos_origin)/wonton-login.php"
   curl -sS --noproxy '*' -o /dev/null -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
-    -H 'Accept: text/html' "$SMOKE_WEB_URL" ||
-    { echo "走不通应用的 SSO 登录链（$SMOKE_WEB_URL）" >&2; return 1; }
+    -H 'Accept: text/html' "$entry" ||
+    { echo "走不通应用的 SSO 登录链（$entry）" >&2; return 1; }
 }
 
 # api_key 在 profile 页明文展示（input#apikey）。没有应用会话时会被重定向到登录页。
+# 不用套件的 dweb/web_get：kit 和 e2e 的 SMOKE_WEB_URL 形态不同（一个带路径一个不带），
+# 按 vikunja 的做法用 raw curl 按 origin 直调。
 wallos_api_key() {
   local page key
-  page="$(dweb /profile.php -L)" || { echo "读不到 profile 页：$page" >&2; return 1; }
+  page="$(curl -sS --noproxy '*' -L --fail-with-body -b "${SMOKE_JAR:-}" "$(wallos_origin)/profile.php")" ||
+    { echo "读不到 profile 页：$page" >&2; return 1; }
   key="$(grep -oP 'id="apikey"[^>]*value="\K[^"]+' <<<"$page" | head -1)"
   [[ -n "$key" ]] || { echo "profile 页里没有 api_key（没登录？）" >&2; return 1; }
   printf '%s' "$key"
@@ -123,27 +128,51 @@ wallos_container() { # 按核心打的标签找本实例的 wallos 服务容器�
   docker ps --format '{{.Names}}' "${args[@]}" | head -1
 }
 
-extra_check() { # 提醒专项：建一条明天到期、提前 1 天提醒的订阅，手动跑提醒 cron，
-                # 等核心把提醒信投进主人的 Wonton 私聊
-  local marker id wait_pid container
-  [[ -n "${SMOKE_OWNER:-}" ]] || { echo "缺冒烟变量：SMOKE_OWNER" >&2; return 1; }
+core_container() { # e2e 环境没有 probes_env 的助手，核心容器名按实例名拼（vikunja 同款）
+  printf '%s' "wonton-${SMOKE_INSTANCE:?}--core"
+}
+
+wonton_chat_events() { # <条数>：主人 Wonton 私聊（通知房间）最近的消息
+  local room adm mu
+  mu="$(docker exec "$(core_container)" printenv WONTON_MATRIX_URL)" || { echo "读不到 Matrix 地址"; return 1; }
+  # 通知房间是第一封信投递时才建的：一封都还没投过时按 0 条算，让轮询去等它出现。
+  room="$(docker exec "$(core_container)" sh -c 'cat "$WONTON_DATA_DIR/core/matrix-notice-room"' 2>/dev/null)" ||
+    { echo '{"chunk":[]}'; return 0; }
+  adm="$(docker exec "$(core_container)" sh -c 'cat "$WONTON_DATA_DIR/core/matrix-admin-token"' 2>/dev/null)" ||
+    { echo "读不到 Matrix 管理令牌"; return 1; }
+  docker run --rm --network "container:$(core_container)" curlimages/curl:8.23.0 --noproxy '*' -s \
+    -H "Authorization: Bearer $adm" "$mu/_matrix/client/v3/rooms/$room/messages?limit=$1&dir=b"
+}
+
+_delivered_after() { # <发送时刻毫秒>：之后投进主人私聊的本插件新邮件事件数
+  wonton_chat_events 30 | jq -r --arg p "${SMOKE_PLUGIN_ID:-app.wallos.wallos}" --argjson ts "$1" \
+    '[.chunk[]? | select(.origin_server_ts > $ts and .content["app.wonton.plugin_mail"].plugin_id == $p)] | length'
+}
+
+extra_check() { # 提醒专项：建一条明天到期、提前 1 天提醒的订阅，手动跑提醒 cron（上游的
+                # cron 每天才跑一次，等不了），等核心把提醒信投进主人的 Wonton 私聊。
+                # 核心的收信事件断线重连期间受理的信会丢（vikunja 实测），没等到就再试一次。
+  local marker id sent_at out seen=0 container attempt i
   wallos_session || return 1
   container="$(wallos_container)"
   [[ -n "$container" ]] || { echo "找不到 wallos 服务容器" >&2; return 1; }
-  marker="提醒-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-  # 先挂等待再触发：cron 亚秒内发出、核心亚秒取走，等晚了就错过。
-  probes_owner_room_wait 150 "$marker" & wait_pid=$!
-  id="$(wallos_add_subscription "$marker" "$(wallos_date '+1 day')")" || { kill "$wait_pid" 2>/dev/null; return 1; }
-  echo "建了订阅 $id（$marker，明天到期，提前 1 天提醒），手动触发提醒 cron"
-  if ! docker exec "$container" php /var/www/html/endpoints/cronjobs/sendnotifications.php >>"$PROBES_LOG" 2>&1; then
-    kill "$wait_pid" 2>/dev/null
-    echo "提醒 cron 跑失败，见 $PROBES_LOG"
-    return 1
-  fi
-  if wait "$wait_pid"; then
-    echo "提醒信已投进主人的 Wonton 私聊"
-  else
-    echo "150 秒内没看到提醒信投进主人的私聊（cron 没发或邮件通道没配好，见 $PROBES_LOG）"
-    return 1
-  fi
+  for attempt in 1 2; do
+    marker="提醒-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    id="$(wallos_add_subscription "$marker" "$(wallos_date '+1 day')")" || return 1
+    sent_at="$(date +%s%3N)"
+    echo "建了订阅 $id（$marker，明天到期，提前 1 天提醒），手动触发提醒 cron"
+    if ! docker exec "$container" php /var/www/html/endpoints/cronjobs/sendnotifications.php >/dev/null 2>&1; then
+      echo "提醒 cron 跑失败"
+      return 1
+    fi
+    for i in {1..40}; do
+      sleep 5
+      out="$(_delivered_after "$sent_at")" || { echo "$out"; return 1; }
+      if [[ "$out" != 0 ]]; then seen=1; break; fi
+    done
+    [[ "$seen" == 1 ]] && break
+    echo "200 秒没看到投递（核心收信事件断线窗口可能丢信），再建一条重试"
+  done
+  [[ "$seen" == 1 ]] || { echo "两次提醒都没投进主人的 Wonton 私聊（cron 没发或邮件通道没配好）"; return 1; }
+  echo "提醒信已投进主人的 Wonton 私聊"
 }

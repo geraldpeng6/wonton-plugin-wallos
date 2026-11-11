@@ -130,6 +130,9 @@ x-wonton:
       Sign-in uses your Wonton account; the app opens straight into your subscriptions,
       with no second sign-up or password.
   release_notes: { zh: 首个版本：Wallos 5.11.1，登录接云吞账号，到期提醒发进 Wonton 私聊。, en: "Initial release: Wallos 5.11.1, Wonton sign-in and renewal reminders in your Wonton chat." }
+  setup:
+    zh: 想按人民币看金额：第一次登录后，在应用的 设置 → 货币 里把主货币换成人民币（CNY）。
+    en: "To see amounts in yuan: after the first sign-in, pick CNY as the main currency under Settings → Currency in the app."
   webui:
     service: wallos
     port: 80
