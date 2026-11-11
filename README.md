@@ -1,43 +1,72 @@
-# 云吞插件模板
+# 订阅管家（Wallos）
 
-开发流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)。
+把家里按期扣费的服务——视频会员、网盘、域名、软件授权——记到一处，到期前自动提醒。
 
-这是一个能安装的示例插件 `app.example.hello`：使用 nginx 官方镜像显示问候页，经网关的 `sso: proxy` 注入用户名，页面显示“你好，<用户名>”。示例没有应用账号、持久化数据或 MCP 工具。
+基于 [Wallos](https://wallosapp.com)（上游，GPL-3.0），用上游官方镜像
+`bellamy/wallos` 按摘要固定。本插件不改上游代码，只做接入：登录、提醒和数据位置如下。
 
-## 示例文件
+## 登录
 
-| 路径 | 内容 |
+用云吞的账号登录（OIDC）：打开插件网页就进云吞登录，落进应用，不用在应用里
+再注册或设密码。首个登录的人是应用管理员（应用自己的规则：第一个用户即管理员）。
+
+- 应用自己的账号密码登录已关闭（上游 `OIDC_DISABLE_PASSWORD_LOGIN`）；
+  应用内的自助注册上游默认就是关的。首个用户出现之前，注册页的表单仍可达（上游对
+  空库不检查注册开关），但只有能打开这个插件网页的人（网关挡着）碰得到，正常入口
+  到不了那里。
+- 家人分享打开后，家人从自己的云吞账号登录，各自是应用里的普通用户。
+
+## 到期提醒
+
+到期前 1 天提醒（应用内每个订阅可单独改天数），提醒经云吞的内部邮箱转进你的
+Wonton 私聊。应用里邮件通知的 SMTP 连接设置由插件负责，会跟着云吞的注入值刷新；
+邮件通知的开关和每个订阅的提醒天数是你自己的设置，插件不覆盖。
+
+## 数据在哪
+
+插件数据目录（`WONTON_APP_DATA`）下：
+
+| 子目录 | 内容 |
 | --- | --- |
-| `docker-compose.yml` | 示例清单、nginx 服务和三个 `configs` |
-| `web/default.conf.template` | nginx 配置，启用 SSI 回显用户名并提供健康检查入口；只放行来自核心地址（`${WONTON_CORE_ADDRESS}`）的请求，其余来源 403 |
-| `web/index.html` | 问候页 |
-| `web/tokens.css` | 页面主题变量的后备值 |
-| `tabs/` | 示例主页的应用页面图标 |
-| `screenshots/home.png` | 商店详情页的示例截图 |
-| `scripts/smoke-probes.sh` | 检查真实页面和网关注入身份的插件探针 |
+| `db/` | SQLite 库（订阅、分类、设置） |
+| `logos/` | 订阅图标 |
 
-从模板创建自己的插件后，替换示例清单、网页和素材；具体步骤见[写插件](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件)。
+卸载选「删除数据」会一并删掉；保留数据重装后订阅和设置都在。
 
-## 对着别的栈跑探针
+## 要出网的功能
 
-`probes`、`api`、`session` 按 `.wonton/.env` 的 `WONTON_BASE_DOMAIN` 拼核心地址，`up` 起的栈自己写这个键。插件装进别人的栈、或者对着已有环境排查时，把那套栈的基础域名写进 `.wonton/.env`，不要只按实例名猜地址：实例名只是资源名前缀，网关按 Host 认域名，拼错了会回“没有安装”。
+插件申请了出网权限，用于：
 
-```bash
-WONTON_BASE_DOMAIN=wonton.localhost
-```
+- **汇率自动更新**：在应用 设置 → 货币 里把汇率源选成 Frankfurter（免费、不用
+  key）就能自动换算多币种；想用 Fixer/Apilayer 的话自己填 key。不选就只按
+  手动填的汇率换算，不影响记账。
+- **订阅图标搜索**：在应用设置里填你自己的 SerpAPI key 后可用。
+- **更新检查**：应用定期查上游有没有新版本。
 
-## 核心镜像
+主货币上游默认是欧元（首次登录自动建号时写死的上游默认），想按人民币看金额：
+第一次登录后在 设置 → 货币 里把主货币换成人民币（CNY），再把汇率源选成
+Frankfurter，欧元价目的订阅就按 ¥ 自动换算显示。
 
-检查和冒烟默认用套件里的核心镜像（`ghcr.io/wontonapp/wonton-core:main`）；要固定别的核心镜像，在仓库 Settings → Variables 设 `WONTON_CORE_IMAGE`，手动触发“检查”时填的 `core-image` 输入优先。
+## 和云吞家人名单的关系
 
-## 更新开发套件
+应用的「家庭成员」是账本里记录谁付钱的条目，在应用内手动添加，不和云吞的
+家人名单自动同步。
 
-```bash
-scripts/dev.sh kit-update
-```
+## Agent
 
-在从模板新建的插件仓库中更新套件；本仓库是套件源头，执行时只提示并退出。版本、可选引用和自定义脚本约定见[开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#更新开发套件)。
+上游只有 REST API（`api/`，用自己的 api_key），没有 MCP。等插件底座支持
+REST/OpenAPI 接入后，Agent 才能帮你查订阅、记订阅。
 
-## 图标
+## 已知限制
 
-`icon.svg` 是本仓库原创线条图标，按本仓库 MIT 许可证分发，见 [NOTICE](NOTICE)。
+- 汇率源 Frankfurter 走 PHP 流封装，不读代理环境变量：主机需要经代理才能出网时，
+  汇率刷新会失败（应用里如实报错），图标搜索和更新检查不受影响（走 libcurl）。
+- 首个用户出现之前，应用内注册页的表单仍可达（上游对空库不检查注册开关）；网关挡着
+  只有主人碰得到，正常入口到不了那里。用它建的本地账号没有绑定云吞登录，属误操作，
+  删掉即可。
+
+## 开发
+
+流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)，
+清单字段见[插件规范](https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md)。
+图标来源和许可见 [NOTICE](NOTICE)。

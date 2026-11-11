@@ -1,7 +1,12 @@
 图标
 ====
 
-`icon.svg` 为本仓库原创，按插件规范的线条风格手写，未用图片模型生成。从模板新建的插件换成自己的图标时，这里按实际情况重写。
+`icon.png` 原样取自上游 Wallos 仓库的 `images/icon/maskable_icon_x512.png`
+（https://github.com/ellite/Wallos ，commit 50e92d7，v5.11.1），未做修改。
+
+Wallos 与其标志版权归 ellite（Damian Gora）所有，Wallos 以 GNU General Public
+License v3.0 授权（上游 LICENSE.md）。Wallos 名称和标志是其各自所有者的商标；
+本插件仓库与上游无隶属或背书关系，图标仅用于指明本插件封装的是该应用。
 
 许可证
 ------
