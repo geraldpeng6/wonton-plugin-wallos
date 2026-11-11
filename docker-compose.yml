@@ -1,78 +1,158 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# Wallos：订阅和续费管家（视频会员、云盘、域名等按期扣费的服务）。
+# 上游单容器：nginx + php-fpm + cron 同进程组（startup.sh 托管），SQLite 存数据。
+# 登录走核心 OIDC（上游官方环境变量，运行时覆盖数据库值，不预建账号，首次登录自动建号）；
+# 到期提醒经核心的内部 SMTP 转进主人的 Wonton 私聊。
 services:
-  web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+  wallos:
+    image: bellamy/wallos:5.11.1@sha256:182d4be4dae26834cc5cec3686bb142e78b0a139a0eb1059355d061d8c0de3e5
+    # 上游 startup.sh 以 root 起步，把 www-data 改成 PUID/PGID 后降权，容器不能直接写 user:。
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
+      TZ: ${TZ}
+      PUID: ${PUID}
+      PGID: ${PGID}
+      # 登录只认核心的身份提供方；全部是上游官方环境变量（README「OIDC」节），运行时覆盖数据库值。
+      OIDC_ENABLED: "1"
+      OIDC_PROVIDER_NAME: 云吞
+      OIDC_ISSUER: ${WONTON_OIDC_ISSUER}
+      OIDC_CLIENT_ID: ${WONTON_OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${WONTON_OIDC_CLIENT_SECRET}
+      # 回调落在插件根：任意带 ?code=&state= 的页面都会被上游 checksession 处理，
+      # 核心按清单的 redirect_paths 登记回调地址，两者必须一致。
+      OIDC_REDIRECT_URL: ${WONTON_APP_URL}/
+      OIDC_AUTO_CREATE_USER: "1"
+      OIDC_DISABLE_PASSWORD_LOGIN: "1"
+      # 认人只按 sub；首次建号走 email 声明，不依赖 email_verified（IdP 是核心自己）。
+      OIDC_REQUIRE_EMAIL_VERIFIED: "0"
+      # 上游对 OIDC 端点和 SMTP 主机做私网拦截（SSRF allowlist）。核心的 auth/smtp
+      # 别名都是私网名；allowlist 存在 admin 表，由 seed 服务按注入值刷新（见 seed.php），
+      # compose 的插值不支持从 WONTON_OIDC_ISSUER 里剥出主机名。
+    volumes:
+      # SQLite 库（wallos.db）。
+      - ${WONTON_APP_DATA}/db:/var/www/html/db
+      # 订阅图标。
+      - ${WONTON_APP_DATA}/logos:/var/www/html/images/uploads/logos
     configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      # 网页入口（webui.path /wonton-login.php）：种 OIDC state 后直跳核心登录。
+      - source: wonton-login
+        target: /var/www/html/wonton-login.php
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      # health.php 只回 200 不查东西；login.php 真读 SQLite 渲染页面，
+      # 没用户时 302 去注册页，curl 同样算通。
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1/login.php"]
       interval: 30s
       timeout: 5s
-      start_period: 30s
-      start_interval: 1s
+      start_period: 60s
+      start_interval: 2s
+
+  seed:
+    # 一次性服务：把邮件提醒通道写进应用配置表（email_notifications /
+    # notification_settings），上游这两项只能登录后在网页里填，没有环境变量。
+    # 装好时还没有用户，先写 user_id=1——首次 OIDC 登录自动建号就是 id 1（管理员）。
+    image: bellamy/wallos:5.11.1@sha256:182d4be4dae26834cc5cec3686bb142e78b0a139a0eb1059355d061d8c0de3e5
+    user: "${PUID}:${PGID}"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        i=0
+        until test -w /var/www/html/db/wallos.db; do
+          i=$$((i+1))
+          if [ "$$i" -gt 60 ]; then
+            echo "wallos.db 还没就绪或还没交给运行用户（应用初始化未完成）" >&2
+            exit 1
+          fi
+          sleep 2
+        done
+        exec php /wonton/seed.php
+    environment:
+      WONTON_SMTP_HOST: ${WONTON_SMTP_HOST}
+      WONTON_SMTP_PORT: ${WONTON_SMTP_PORT}
+      WONTON_MAIL_FROM: ${WONTON_MAIL_FROM}
+      WONTON_OIDC_ISSUER: ${WONTON_OIDC_ISSUER}
+    volumes:
+      - ${WONTON_APP_DATA}/db:/var/www/html/db
+    configs:
+      - source: seed
+        target: /wonton/seed.php
+    depends_on:
+      wallos:
+        condition: service_healthy
+    network_mode: none
+    restart: "no"
 
 configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
+  seed:
+    file: seed.php
+  wonton-login:
+    file: wonton-login.php
 
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.11"
+  id: app.wallos.wallos
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
-  icon: icon.svg
+  title: { zh: 订阅管家（Wallos）, en: Wallos }
+  description:
+    zh: 像给订阅请的记账员：视频会员、网盘、域名这些按期扣费的服务记在一起，到期前提醒，全家花销一目了然
+    en: "A ledger for your recurring subscriptions: track what you pay for, see upcoming renewals and get a heads-up before each due date"
+  icon: icon.png
   notices: [NOTICE]
-  screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  screenshots: [screenshots/subscriptions.png, screenshots/home.png]
+  author: { name: geraldpeng6, url: https://github.com/geraldpeng6 }
+  homepage: https://wallosapp.com
+  license: GPL-3.0-only
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [记账, 订阅]
+    en: [Finance, Subscriptions]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      把家里按期扣费的服务（视频会员、网盘、域名、软件授权……）记到一处：每笔记价格和周期，
+      日历里看最近的扣费日，统计里看每月、每年一共花多少。
+
+      到期前几天自动提醒，提醒会出现在你的 Wonton 私聊里，不用盯着每个服务的续费日。
+
+      支持多币种：在应用设置里把汇率源选成 Frankfurter（免费、不用 key）就能自动换算，
+      想用 Fixer 的话自己填 key。应用内还能加家庭成员，记录每笔订阅是谁付的。
+
+      登录用云吞的账号，打开就在里面，不用再注册或设密码。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+      Keep every recurring charge in one place: subscriptions for streaming, cloud storage,
+      domains and software, each with its price and cycle, a calendar of upcoming renewals
+      and monthly/yearly statistics.
+
+      You get a heads-up in your Wonton chat a few days before each due date, so renewals
+      never sneak up on you.
+
+      Multiple currencies are supported: pick Frankfurter (free, no key) as the rate source
+      in the app settings for automatic conversion, or enter your own Fixer key. Household
+      members can be added inside the app to track who pays for what.
+
+      Sign-in uses your Wonton account; the app opens straight into your subscriptions,
+      with no second sign-up or password.
+  release_notes: { zh: 首个版本：Wallos 5.11.1，登录接云吞账号，到期提醒发进 Wonton 私聊。, en: "Initial release: Wallos 5.11.1, Wonton sign-in and renewal reminders in your Wonton chat." }
   webui:
-    service: web
+    service: wallos
     port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
+    # 入口先种 OIDC state 再跳核心登录，不经过上游登录页（上游有用户前还会先跳注册页）。
+    path: /wonton-login.php
+    sso: oidc
+    oidc:
+      # 上游在任意页面处理 ?code=&state= 回调，redirect_url 设的是插件根。
+      redirect_paths: ["/"]
+      # 上游把 client_secret 放在令牌请求体里（handle_oidc_callback.php）。
+      token_endpoint_auth_method: client_secret_post
   tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
+    - id: subscriptions
+      title: { zh: 订阅, en: Home }
+      icon: tabs/subscriptions.svg
+      icon_selected: tabs/subscriptions-fill.svg
       path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+  permissions:
+    # 到期提醒经核心的内部 SMTP 转进收件人的 Wonton 私聊。
+    - notify
+    # 图标搜索（要用户自己的 SerpAPI key）、汇率源（Frankfurter/Fixer）和更新检查要出网。
+    - network.egress
   requirements:
     arch: [amd64, arm64]
+    # 上游没写最低内存，按本机空闲实测取整（安装后空闲实测约 37M，取 64M）。
     memory: 64M

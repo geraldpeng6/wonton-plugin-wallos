@@ -1,61 +1,149 @@
-# shellcheck shell=bash
 # scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
-#
-# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
-# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
-#
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
+# shellcheck shell=bash disable=SC2034
 #
 # 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# 身份：identity_check 用应用自己的"当前用户"接口断言认出的是用户管理员。
+#       dweb / web_get 是带用户会话的请求助手；SSO 登录跳转用 dweb <路径> --sso
+#       （从清单 webui.path 的入口出发，跟完核心登录页的 JS 自动表单和应用回调）。
+# 工具：本插件没有 MCP（上游只有 REST API），清单不写 mcp，套件按 N/A 处理。
+# 通知：extra_check 由 e2e 冒烟跑：建一条明天到期、提前 1 天提醒的订阅，手动触发上游的
+#       提醒 cron，等提醒信投进主人的 Wonton 私聊。
+# 数据：data_write/data_check 用应用自己的 REST API（api_key 认证，key 从 profile 页取）。
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
-
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+wallos_origin() { # 入口可能带路径（/wonton-login.php），拼 API 前取 origin
+  local u="${SMOKE_WEB_URL%%\?*}" rest="${SMOKE_WEB_URL#*://}"
+  printf '%s://%s' "${u%%://*}" "${rest%%/*}"
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+# 应用会话：先补核心会话（vikunja 同款：主流程可能还没登核心），再走入口。
+# 入口 wonton-login.php → 核心授权（带核心会话一路 302）→ 应用回调建会话。
+# 不用 dweb --sso：套件的表单识别会把 Wallos 页面里的 POST 表单（如加订阅）当成 SSO 表单去提交。
+wallos_session() {
+  [[ -n "${SMOKE_JAR:-}" && -n "${SMOKE_BASE:-}" && -n "${SMOKE_TOKEN:-}" && -n "${SMOKE_WEB_URL:-}" ]] ||
+    { echo "缺冒烟变量：需要 SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN/SMOKE_WEB_URL" >&2; return 1; }
+  curl -sS --noproxy '*' -o /dev/null -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    --data-urlencode "token=$SMOKE_TOKEN" "$SMOKE_BASE/_wonton/login" ||
+    { echo "主人令牌登不进核心" >&2; return 1; }
+  curl -sS --noproxy '*' -o /dev/null -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    -H 'Accept: text/html' "$SMOKE_WEB_URL" ||
+    { echo "走不通应用的 SSO 登录链（$SMOKE_WEB_URL）" >&2; return 1; }
+}
+
+# api_key 在 profile 页明文展示（input#apikey）。没有应用会话时会被重定向到登录页。
+wallos_api_key() {
+  local page key
+  page="$(dweb /profile.php -L)" || { echo "读不到 profile 页：$page" >&2; return 1; }
+  key="$(grep -oP 'id="apikey"[^>]*value="\K[^"]+' <<<"$page" | head -1)"
+  [[ -n "$key" ]] || { echo "profile 页里没有 api_key（没登录？）" >&2; return 1; }
+  printf '%s' "$key"
+}
+
+web_assert() { grep -qi 'wallos'; }   # 应用真实页面（登录页和登录后的页面都带）
+
+identity_check() {
+  local key me
+  wallos_session || return 1
+  key="$(wallos_api_key)" || return 1
+  # 应用自己的"当前用户"接口：按 api_key 认出调用者。
+  me="$(curl -sS --noproxy '*' --fail-with-body -b "$SMOKE_JAR" \
+    "$(wallos_origin)/api/users/get_user.php?api_key=$key")" ||
+    { echo "get_user 接口失败：$me"; return 1; }
+  jq -e --arg u "$SMOKE_OWNER" '.success == true and .user.username == $u' <<<"$me" >/dev/null ||
+    { echo "当前用户不是 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
+}
+
+# 数据：一条真实用户数据——用 REST API 建订阅，名字带随机标记，升级/重装后按 id 读回。
+# SMOKE_STATE 在套件里是状态目录（e2e 传的是标记文件本身），标记放对应路径。
+wallos_marker_file() {
+  if [[ -d "${SMOKE_STATE:-}" ]]; then printf '%s' "$SMOKE_STATE/wallos-marker"; else printf '%s' "${SMOKE_STATE:-}"; fi
+}
+
+wallos_add_subscription() { # <名字> <next_payment YYYY-MM-DD>：输出订阅 id
+  local key out id
+  key="$(wallos_api_key)" || return 1
+  out="$(curl -sS --noproxy '*' --fail-with-body -b "$SMOKE_JAR" -X POST \
+    "$(wallos_origin)/api/subscriptions/set_subscriptions.php" \
+    --data-urlencode "api_key=$key" \
+    --data-urlencode "action=add" \
+    --data-urlencode "name=$1" \
+    --data-urlencode "price=9.9" \
+    --data-urlencode "currency_id=1" \
+    --data-urlencode "cycle=3" \
+    --data-urlencode "frequency=1" \
+    --data-urlencode "next_payment=$2" \
+    --data-urlencode "notify=1" \
+    --data-urlencode "notify_days_before=1")" ||
+    { echo "建订阅失败：$out"; return 1; }
+  id="$(jq -r '.subscriptionId // empty' <<<"$out")"
+  [[ -n "$id" ]] || { echo "建订阅没回 id：$(head -c 200 <<<"$out")"; return 1; }
+  printf '%s' "$id"
+}
+
+wallos_date() { # <+N days>：日期按应用的时区算（开发栈和宿主时区可能不同，到期判断是精确天数差）
+  local container
+  container="$(wallos_container)"
+  [[ -n "$container" ]] || { echo "找不到 wallos 服务容器" >&2; return 1; }
+  docker exec "$container" php -r "echo date('Y-m-d', strtotime('$1'));"
+}
+
+data_write() {
+  local marker id marker_file
+  wallos_session || return 1
+  marker="保数据-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  id="$(wallos_add_subscription "$marker" "$(wallos_date '+7 days')")" || return 1
+  marker_file="$(wallos_marker_file)"
+  jq -nc --arg m "$marker" --arg i "$id" '{marker:$m,id:$i}' >"$marker_file" ||
+    { echo "标记写不进 $marker_file" >&2; return 1; }
+}
+
+data_check() {
+  local marker_file marker id seen
+  wallos_session || return 1
+  marker_file="$(wallos_marker_file)"
+  marker="$(jq -r .marker "$marker_file" 2>/dev/null)" ||
+    { echo "读不到标记（data_write 没跑过？）" >&2; return 1; }
+  id="$(jq -r .id "$marker_file")"
+  seen="$(curl -sS --noproxy '*' -b "$SMOKE_JAR" \
+    "$(wallos_origin)/api/subscriptions/get_subscriptions.php?api_key=$(wallos_api_key)")" ||
+    { echo "订阅列表读不到：$seen"; return 1; }
+  jq -e --arg i "$id" --arg m "$marker" \
+    '.success == true and ([.subscriptions[] | select(.id == ($i | tonumber) and .name == $m)] | length == 1)' \
+    <<<"$seen" >/dev/null ||
+    { echo "重装后读不回标记订阅（期待 id=$id 名字=$marker）：$(echo "$seen" | jq -c '[.subscriptions[] | {id, name}]' 2>/dev/null | head -c 300)"; return 1; }
+}
+
+# ---------- 通知（notify）：真触发一次提醒，核对核心投进私聊（extra_check 由 e2e 冒烟跑） ----------
+
+wallos_container() { # 按核心打的标签找本实例的 wallos 服务容器，插件 smoke 和 e2e 都成立
+  local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=${SMOKE_PLUGIN_ID:-app.wallos.wallos}" --filter "label=wonton.service=wallos")
+  if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
+    inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
+  fi
+  [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
+  docker ps --format '{{.Names}}' "${args[@]}" | head -1
+}
+
+extra_check() { # 提醒专项：建一条明天到期、提前 1 天提醒的订阅，手动跑提醒 cron，
+                # 等核心把提醒信投进主人的 Wonton 私聊
+  local marker id wait_pid container
+  [[ -n "${SMOKE_OWNER:-}" ]] || { echo "缺冒烟变量：SMOKE_OWNER" >&2; return 1; }
+  wallos_session || return 1
+  container="$(wallos_container)"
+  [[ -n "$container" ]] || { echo "找不到 wallos 服务容器" >&2; return 1; }
+  marker="提醒-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  # 先挂等待再触发：cron 亚秒内发出、核心亚秒取走，等晚了就错过。
+  probes_owner_room_wait 150 "$marker" & wait_pid=$!
+  id="$(wallos_add_subscription "$marker" "$(wallos_date '+1 day')")" || { kill "$wait_pid" 2>/dev/null; return 1; }
+  echo "建了订阅 $id（$marker，明天到期，提前 1 天提醒），手动触发提醒 cron"
+  if ! docker exec "$container" php /var/www/html/endpoints/cronjobs/sendnotifications.php >>"$PROBES_LOG" 2>&1; then
+    kill "$wait_pid" 2>/dev/null
+    echo "提醒 cron 跑失败，见 $PROBES_LOG"
+    return 1
+  fi
+  if wait "$wait_pid"; then
+    echo "提醒信已投进主人的 Wonton 私聊"
+  else
+    echo "150 秒内没看到提醒信投进主人的私聊（cron 没发或邮件通道没配好，见 $PROBES_LOG）"
+    return 1
+  fi
+}
